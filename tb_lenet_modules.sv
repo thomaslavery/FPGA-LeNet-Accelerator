@@ -445,44 +445,143 @@ module tb_lenet_modules;
             lenet_fc7_b[j] = '0;
 
         $display("  Starting forward pass...");
-        @(posedge clk); #1;
-        lenet_start = 1;
-        @(posedge clk); #1;
-        lenet_start = 0;
 
-        // Wait for completion with timeout
+        // ---- Latency measurement ----
         begin
+            integer cycle_start, cycle_end, total_cycles;
+            integer c1_start, c1_end, s2_start, s2_end;
+            integer c3_start, c3_end, s4_start, s4_end;
+            integer fc5_start, fc5_end, fc6_start, fc6_end;
+            integer fc7_start, fc7_end;
             integer timeout_cnt;
+
+            cycle_start = 0;
+            c1_start = 0; c1_end = 0; s2_start = 0; s2_end = 0;
+            c3_start = 0; c3_end = 0; s4_start = 0; s4_end = 0;
+            fc5_start = 0; fc5_end = 0; fc6_start = 0; fc6_end = 0;
+            fc7_start = 0; fc7_end = 0;
+
+            @(posedge clk); #1;
+            lenet_start = 1;
+            cycle_start = $time / 10;  // each cycle = 10ns
+            @(posedge clk); #1;
+            lenet_start = 0;
+
+            // Track per-layer cycles using lenet's internal state
+            // State encoding: IDLE=0, L_C1=1, L_S2=2, L_C3=3, L_S4=4,
+            //                 L_FC5=5, L_FC6=6, L_FC7=7, L_DONE=8
+            c1_start = $time / 10;
+
             timeout_cnt = 0;
             while (lenet_done !== 1'b1 && timeout_cnt < 500000) begin
+                // Detect layer transitions by watching internal state
+                if (u_lenet.state == 2 && s2_start == 0) begin
+                    c1_end = $time / 10; s2_start = $time / 10;
+                end
+                if (u_lenet.state == 3 && c3_start == 0) begin
+                    s2_end = $time / 10; c3_start = $time / 10;
+                end
+                if (u_lenet.state == 4 && s4_start == 0) begin
+                    c3_end = $time / 10; s4_start = $time / 10;
+                end
+                if (u_lenet.state == 5 && fc5_start == 0) begin
+                    s4_end = $time / 10; fc5_start = $time / 10;
+                end
+                if (u_lenet.state == 6 && fc6_start == 0) begin
+                    fc5_end = $time / 10; fc6_start = $time / 10;
+                end
+                if (u_lenet.state == 7 && fc7_start == 0) begin
+                    fc6_end = $time / 10; fc7_start = $time / 10;
+                end
                 @(posedge clk); #1;
                 timeout_cnt = timeout_cnt + 1;
             end
+
             if (lenet_done !== 1'b1) begin
                 $display("  TIMEOUT: LeNet forward pass did not complete!");
                 fail_count = fail_count + 1;
             end
-        end
 
-        if (lenet_done === 1'b1) begin
-            $display("  Forward pass completed successfully!");
-            $display("  Output scores:");
-            for (int s = 0; s < 10; s++)
-                $display("    scores[%0d] = %0d", s,
-                         $signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]));
+            if (lenet_done === 1'b1) begin
+                fc7_end = $time / 10;
+                cycle_end = $time / 10;
+                total_cycles = cycle_end - cycle_start;
 
-            // Verify all scores equal expected value (10668)
-            all_correct = 1;
-            for (int s = 0; s < 10; s++)
-                if ($signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]) !== 10668)
-                    all_correct = 0;
+                $display("  Forward pass completed successfully!");
+                $display("  Output scores:");
+                for (int s = 0; s < 10; s++)
+                    $display("    scores[%0d] = %0d", s,
+                             $signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]));
 
-            if (all_correct) begin
-                $display("  PASS: All scores = 10668 (matches expected)");
-                pass_count = pass_count + 1;
-            end else begin
-                $display("  FAIL: Expected all scores = 10668");
-                fail_count = fail_count + 1;
+                // Verify all scores equal expected value (10668)
+                all_correct = 1;
+                for (int s = 0; s < 10; s++)
+                    if ($signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]) !== 10668)
+                        all_correct = 0;
+
+                if (all_correct) begin
+                    $display("  PASS: All scores = 10668 (matches expected)");
+                    pass_count = pass_count + 1;
+                end else begin
+                    $display("  FAIL: Expected all scores = 10668");
+                    fail_count = fail_count + 1;
+                end
+
+                // ==============================================================
+                // LATENCY ANALYSIS
+                // ==============================================================
+                $display("\n========================================");
+                $display("  LATENCY ANALYSIS (clock cycles)");
+                $display("========================================");
+                $display("  C1  (6x conv 1ch 5x5, 32x32->28x28):  %0d cycles", c1_end - c1_start);
+                $display("  S2  (6x avg_pool 2x2, 28x28->14x14):  %0d cycles", s2_end - s2_start);
+                $display("  C3  (16x conv 6ch 5x5, 14x14->10x10): %0d cycles", c3_end - c3_start);
+                $display("  S4  (16x avg_pool 2x2, 10x10->5x5):   %0d cycles", s4_end - s4_start);
+                $display("  FC5 (dense 400->120, 30 neurons/cyc):  %0d cycles", fc5_end - fc5_start);
+                $display("  FC6 (dense 120->84,  21 neurons/cyc):  %0d cycles", fc6_end - fc6_start);
+                $display("  FC7 (dense 84->10,   10 neurons/cyc):  %0d cycles", fc7_end - fc7_start);
+                $display("  ----------------------------------------");
+                $display("  TOTAL end-to-end latency:              %0d cycles", total_cycles);
+                $display("  At 100 MHz -> %0d ns", total_cycles * 10);
+                $display("  Throughput: 1 image / %0d cycles", total_cycles);
+
+                // ==============================================================
+                // RESOURCE UTILIZATION ESTIMATE
+                // ==============================================================
+                $display("\n========================================");
+                $display("  RESOURCE UTILIZATION ESTIMATE");
+                $display("========================================");
+                $display("  Multipliers (parallel instances):");
+                $display("    C1:  6  conv units x 25  MACs each  = 150 multipliers");
+                $display("    C3:  16 conv units x 150 MACs each  = 2400 multipliers");
+                $display("    FC5: 30 neurons/cyc x 400 weights   = 12000 multipliers");
+                $display("    FC6: 21 neurons/cyc x 120 weights   = 2520 multipliers");
+                $display("    FC7: 10 neurons/cyc x 84  weights   = 840 multipliers");
+                $display("    Total active multipliers (peak):     ~12000 (FC5)");
+                $display("");
+                $display("  Activation storage (8-bit signed):");
+                $display("    C1 output:   6 x 28 x 28         = 4704 bytes");
+                $display("    S2 output:   6 x 14 x 14         = 1176 bytes");
+                $display("    C3 output:   16 x 10 x 10        = 1600 bytes");
+                $display("    S4 output:   16 x 5 x 5          = 400 bytes");
+                $display("    FC5 output:  120 values           = 120 bytes");
+                $display("    FC6 output:  84 values            = 84 bytes");
+                $display("    FC7 output:  10 values            = 10 bytes");
+                $display("    Total activation memory:           8094 bytes");
+                $display("");
+                $display("  Weight storage (8-bit signed):");
+                $display("    C1:  6 x 1 x 5 x 5               = 150 bytes");
+                $display("    C3:  16 x 6 x 5 x 5              = 2400 bytes");
+                $display("    FC5: 120 x 400                    = 48000 bytes");
+                $display("    FC6: 84 x 120                     = 10080 bytes");
+                $display("    FC7: 10 x 84                      = 840 bytes");
+                $display("    Total weight memory:               61470 bytes");
+                $display("");
+                $display("  Parallelism summary:");
+                $display("    Conv layers:  fully spatial (all filters parallel)");
+                $display("    Pool layers:  fully spatial (all channels parallel)");
+                $display("    Dense layers: partially unrolled (configurable neurons/cycle)");
+                $display("    Inter-layer:  sequential (no pipelining)");
             end
         end
 
