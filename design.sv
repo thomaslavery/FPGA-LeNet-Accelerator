@@ -44,6 +44,9 @@ module mac_unit #(
 
 endmodule
 
+// Convolution Module — computes all output positions in one cycle
+// using inline dot products (no MAC submodule needed).
+
 module conv_hw #(
     parameter DATA_WIDTH   = 8,
     parameter KERNEL_SIZE  = 5,          // LeNet uses 5x5 kernels
@@ -69,100 +72,35 @@ module conv_hw #(
     output logic                          ready     // high when entire output map is computed
 );
 
-    localparam NUM_K = KERNEL_SIZE * KERNEL_SIZE * IN_CH;
-
-    // Flattened window and weight arrays passed to mac_unit
-    logic signed [DATA_WIDTH-1:0] mac_in  [0:NUM_K-1];
-    logic signed [DATA_WIDTH-1:0] mac_wt  [0:NUM_K-1];
-    logic signed [ACC_WIDTH-1:0]  mac_out;
-    logic                         mac_en;
-    logic                         mac_valid;
-
-    mac_unit #(
-        .DATA_WIDTH   (DATA_WIDTH),
-        .KERNEL_SIZE  (KERNEL_SIZE),
-        .NUM_ELEMENTS (NUM_K)
-    ) u_mac (
-        .clk     (clk),
-        .rst_n   (rst_n),
-        .en      (mac_en),
-        .in_data (mac_in),
-        .weight  (mac_wt),
-        .result  (mac_out),
-        .valid   (mac_valid)
-    );
-
-    // State machine — LOAD asserts mac_en for exactly one cycle per position;
-    // WAIT_VALID de-asserts mac_en then captures the result when mac_valid fires.
-    typedef enum logic [1:0] { IDLE, LOAD, WAIT_VALID, DONE } state_t;
+    typedef enum logic [1:0] { IDLE, DONE } state_t;
     state_t state;
 
-    // Loop counters for sliding window (for H, for W)
-    logic [$clog2(OUT_H)-1:0] row;
-    logic [$clog2(OUT_W)-1:0] col;
-
-    integer kc, kr, ch, idx;
+    logic signed [ACC_WIDTH-1:0] acc;
+    integer orow, ocol, ch, kr, kc;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state  <= IDLE;
-            ready  <= 1'b0;
-            mac_en <= 1'b0;
-            row    <= '0;
-            col    <= '0;
+            state <= IDLE;
+            ready <= 1'b0;
         end else begin
             case (state)
-                // ---- IDLE: wait for start pulse --------------------------
                 IDLE: begin
-                    ready  <= 1'b0;
-                    mac_en <= 1'b0;
+                    ready <= 1'b0;
                     if (start) begin
-                        row   <= '0;
-                        col   <= '0;
-                        state <= LOAD;
-                    end
-                end
-
-                // ---- LOAD: snapshot kernel window into mac_in/mac_wt and
-                //      pulse mac_en for exactly one clock cycle
-                LOAD: begin
-                    idx = 0;
-                    for (ch = 0; ch < IN_CH; ch++) begin
-                        for (kr = 0; kr < KERNEL_SIZE; kr++) begin
-                            for (kc = 0; kc < KERNEL_SIZE; kc++) begin
-                                mac_in[idx] = input_fm[ch][row + kr][col + kc];
-                                mac_wt[idx] = weight[ch][kr][kc];
-                                idx++;
+                        for (orow = 0; orow < OUT_H; orow++) begin
+                            for (ocol = 0; ocol < OUT_W; ocol++) begin
+                                acc = '0;
+                                for (ch = 0; ch < IN_CH; ch++)
+                                    for (kr = 0; kr < KERNEL_SIZE; kr++)
+                                        for (kc = 0; kc < KERNEL_SIZE; kc++)
+                                            acc = acc + (input_fm[ch][orow + kr][ocol + kc] * weight[ch][kr][kc]);
+                                result[orow][ocol] = acc;
                             end
                         end
-                    end
-                    mac_en <= 1'b1;
-                    state  <= WAIT_VALID;
-                end
-
-                // ---- WAIT_VALID: de-assert mac_en, wait for MAC result ----
-                WAIT_VALID: begin
-                    mac_en <= 1'b0;
-                    if (mac_valid) begin
-                        result[row][col] <= mac_out;
-
-                        // Advance sliding window: stride = 1
-                        if (col == OUT_W - 1) begin
-                            col <= '0;
-                            if (row == OUT_H - 1) begin
-                                state <= DONE;
-                            end else begin
-                                row   <= row + 1'b1;
-                                state <= LOAD;
-                            end
-                        end else begin
-                            col   <= col + 1'b1;
-                            state <= LOAD;
-                        end
+                        state <= DONE;
                     end
                 end
 
-                // ---- DONE: assert ready for one cycle then return to IDLE
                 DONE: begin
                     ready <= 1'b1;
                     state <= IDLE;
@@ -176,10 +114,7 @@ module conv_hw #(
 endmodule
 
 // Pooling Module — Average and Max pooling
-// Applies a 2x2 pool window over the input feature map.
-// MODE selects AVG (0) or MAX (1) at instantiation time.
-//
-// Diagram: i → |Pool AVG/M| → result
+// Computes all output positions in one cycle.
 
 module pool #(
     parameter DATA_WIDTH  = 8,
@@ -203,76 +138,45 @@ module pool #(
 );
 
     localparam NUM_POOL = POOL_SIZE * POOL_SIZE;
-    // Extra bit for the average sum before right-shift
     localparam SUM_WIDTH = DATA_WIDTH + $clog2(NUM_POOL);
 
-    // State machine
-    typedef enum logic [1:0] { IDLE, POOL_COMPUTE, DONE } state_t;
+    typedef enum logic [1:0] { IDLE, DONE } state_t;
     state_t state;
 
-    logic [$clog2(OUT_H)-1:0] row;
-    logic [$clog2(OUT_W)-1:0] col;
-
-    integer pr, pc;
+    integer pr, pc, wr, wc;
     logic signed [SUM_WIDTH-1:0] sum;
     logic signed [DATA_WIDTH-1:0] max_val;
-    logic signed [DATA_WIDTH-1:0] pixel;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
             valid <= 1'b0;
-            row   <= '0;
-            col   <= '0;
         end else begin
             case (state)
-                // ---- IDLE ------------------------------------------------
                 IDLE: begin
                     valid <= 1'b0;
                     if (start) begin
-                        row   <= '0;
-                        col   <= '0;
-                        state <= POOL_COMPUTE;
-                    end
-                end
-
-                // ---- POOL_COMPUTE: slide POOL_SIZE x POOL_SIZE window -----
-                POOL_COMPUTE: begin
-                    // Initialize accumulators
-                    sum     = '0;
-                    max_val = i[row * POOL_SIZE][col * POOL_SIZE];  // top-left cell
-
-                    // Iterate over the pool window
-                    for (pr = 0; pr < POOL_SIZE; pr++) begin
-                        for (pc = 0; pc < POOL_SIZE; pc++) begin
-                            pixel = i[row * POOL_SIZE + pr][col * POOL_SIZE + pc];
-                            sum  = sum + pixel;
-                            if (pixel > max_val)
-                                max_val = pixel;
+                        for (pr = 0; pr < OUT_H; pr++) begin
+                            for (pc = 0; pc < OUT_W; pc++) begin
+                                sum = '0;
+                                max_val = i[pr * POOL_SIZE][pc * POOL_SIZE];
+                                for (wr = 0; wr < POOL_SIZE; wr++) begin
+                                    for (wc = 0; wc < POOL_SIZE; wc++) begin
+                                        sum = sum + i[pr * POOL_SIZE + wr][pc * POOL_SIZE + wc];
+                                        if (i[pr * POOL_SIZE + wr][pc * POOL_SIZE + wc] > max_val)
+                                            max_val = i[pr * POOL_SIZE + wr][pc * POOL_SIZE + wc];
+                                    end
+                                end
+                                if (MODE == 0)
+                                    result[pr][pc] = sum >>> $clog2(NUM_POOL);
+                                else
+                                    result[pr][pc] = max_val;
+                            end
                         end
-                    end
-
-                    // Write result based on selected mode
-                    if (MODE == 0)
-                        // AVG: divide by pool area (arithmetic right-shift for power-of-2 sizes)
-                        result[row][col] <= sum >>> $clog2(NUM_POOL);
-                    else
-                        // MAX
-                        result[row][col] <= max_val;
-
-                    // Advance window position
-                    if (col == OUT_W - 1) begin
-                        col <= '0;
-                        if (row == OUT_H - 1)
-                            state <= DONE;
-                        else
-                            row <= row + 1'b1;
-                    end else begin
-                        col <= col + 1'b1;
+                        state <= DONE;
                     end
                 end
 
-                // ---- DONE ------------------------------------------------
                 DONE: begin
                     valid <= 1'b1;
                     state <= IDLE;
@@ -286,9 +190,7 @@ module pool #(
 endmodule
 
 // ReLU Activation Module — Element-wise ReLU
-// Computes: out[i] = (in[i] > 0) ? in[i] : 0
-//
-// Diagram: in[i] → |ReLU| → max(0, in[i])
+// Processes all elements in one cycle.
 
 module relu #(
     parameter DATA_WIDTH = 8,
@@ -304,37 +206,28 @@ module relu #(
     output logic                          valid
 );
 
-    typedef enum logic [1:0] { IDLE, COMPUTE, DONE } state_t;
+    typedef enum logic [1:0] { IDLE, DONE } state_t;
     state_t state;
 
-    logic [$clog2(NUM_ELEMENTS)-1:0] idx;
+    integer j;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
             valid <= 1'b0;
-            idx   <= '0;
         end else begin
             case (state)
                 IDLE: begin
                     valid <= 1'b0;
                     if (start) begin
-                        idx   <= '0;
-                        state <= COMPUTE;
-                    end
-                end
-
-                COMPUTE: begin
-                    // ReLU: clamp negative values to zero
-                    if (in_data[idx] < 0)
-                        out_data[idx] <= '0;
-                    else
-                        out_data[idx] <= in_data[idx];
-
-                    if (idx == NUM_ELEMENTS - 1)
+                        for (j = 0; j < NUM_ELEMENTS; j++) begin
+                            if (in_data[j] < 0)
+                                out_data[j] = '0;
+                            else
+                                out_data[j] = in_data[j];
+                        end
                         state <= DONE;
-                    else
-                        idx <= idx + 1'b1;
+                    end
                 end
 
                 DONE: begin
@@ -350,11 +243,7 @@ module relu #(
 endmodule
 
 // Dense (Fully Connected) Layer Module
-// Computes: out[j] = Σ in[i] * weight[j][i] + bias[j]  for each output neuron j
-//
-// Diagram: in[i] → |Dense FC| → Σ i·w + b
-//          w[j][i] →
-//          b[j]    →
+// Computes all output neurons in one cycle.
 
 module dense #(
     parameter DATA_WIDTH    = 8,
@@ -380,45 +269,31 @@ module dense #(
     output logic                          valid
 );
 
-    typedef enum logic [1:0] { IDLE, COMPUTE, DONE } state_t;
+    typedef enum logic [1:0] { IDLE, DONE } state_t;
     state_t state;
 
-    logic [$clog2(OUT_FEATURES)-1:0] neuron;  // current output neuron index
-
     logic signed [ACC_WIDTH-1:0] acc;
-    integer i;
+    integer j, k;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state  <= IDLE;
-            valid  <= 1'b0;
-            neuron <= '0;
+            state <= IDLE;
+            valid <= 1'b0;
         end else begin
             case (state)
-                // ---- IDLE: wait for start pulse --------------------------
                 IDLE: begin
                     valid <= 1'b0;
                     if (start) begin
-                        neuron <= '0;
-                        state  <= COMPUTE;
-                    end
-                end
-
-                // ---- COMPUTE: dot product for one output neuron per cycle
-                COMPUTE: begin
-                    acc = bias[neuron];
-                    for (i = 0; i < IN_FEATURES; i++) begin
-                        acc = acc + (in_data[i] * weight[neuron][i]);
-                    end
-                    out_data[neuron] <= acc;
-
-                    if (neuron == OUT_FEATURES - 1)
+                        for (j = 0; j < OUT_FEATURES; j++) begin
+                            acc = bias[j];
+                            for (k = 0; k < IN_FEATURES; k++)
+                                acc = acc + (in_data[k] * weight[j][k]);
+                            out_data[j] = acc;
+                        end
                         state <= DONE;
-                    else
-                        neuron <= neuron + 1'b1;
+                    end
                 end
 
-                // ---- DONE: assert valid for one cycle then return to IDLE
                 DONE: begin
                     valid <= 1'b1;
                     state <= IDLE;
