@@ -46,7 +46,7 @@ module tb_lenet_modules;
 
     logic signed [7:0]         fm   [0:0][0:IMG_H-1][0:IMG_W-1];
     logic signed [7:0]         wt   [0:0][0:KS-1][0:KS-1];
-    logic signed [CACC-1:0]    conv_result [0:OUT_H-1][0:OUT_W-1];
+    logic [CACC*OUT_H*OUT_W-1:0] conv_result_flat;
     logic                      conv_start, conv_ready;
 
     conv_hw #(
@@ -61,7 +61,7 @@ module tb_lenet_modules;
         .start    (conv_start),
         .input_fm (fm),
         .weight   (wt),
-        .result   (conv_result),
+        .result_flat (conv_result_flat),
         .ready    (conv_ready)
     );
 
@@ -69,7 +69,7 @@ module tb_lenet_modules;
     // 3. POOL TEST  (4x4 input -> 2x2 output, AVG mode)
     // =======================================================================
     logic signed [7:0] pool_in  [0:3][0:3];
-    logic signed [7:0] pool_out [0:1][0:1];
+    logic [8*2*2-1:0]  pool_out_flat;
     logic              pool_start, pool_valid;
 
     pool #(
@@ -83,7 +83,7 @@ module tb_lenet_modules;
         .rst_n  (rst_n),
         .start  (pool_start),
         .i      (pool_in),
-        .result (pool_out),
+        .result_flat (pool_out_flat),
         .valid  (pool_valid)
     );
 
@@ -93,7 +93,7 @@ module tb_lenet_modules;
     localparam RELU_N = 5;
 
     logic signed [7:0] relu_in  [0:RELU_N-1];
-    logic signed [7:0] relu_out [0:RELU_N-1];
+    logic [8*RELU_N-1:0] relu_out_flat;
     logic              relu_start, relu_valid;
 
     relu #(
@@ -104,7 +104,7 @@ module tb_lenet_modules;
         .rst_n    (rst_n),
         .start    (relu_start),
         .in_data  (relu_in),
-        .out_data (relu_out),
+        .out_flat (relu_out_flat),
         .valid    (relu_valid)
     );
 
@@ -118,7 +118,7 @@ module tb_lenet_modules;
     logic signed [7:0]            dense_in  [0:DENSE_IN-1];
     logic signed [7:0]            dense_w   [0:DENSE_OUT-1][0:DENSE_IN-1];
     logic signed [DENSE_ACC-1:0]  dense_b   [0:DENSE_OUT-1];
-    logic signed [DENSE_ACC-1:0]  dense_out [0:DENSE_OUT-1];
+    logic [DENSE_ACC*DENSE_OUT-1:0] dense_out_flat;
     logic                         dense_start, dense_valid;
 
     dense #(
@@ -132,7 +132,7 @@ module tb_lenet_modules;
         .in_data (dense_in),
         .weight  (dense_w),
         .bias    (dense_b),
-        .out_data(dense_out),
+        .out_flat(dense_out_flat),
         .valid   (dense_valid)
     );
 
@@ -153,7 +153,7 @@ module tb_lenet_modules;
     logic signed [FC6_ACC_W-1:0] lenet_fc6_b     [0:83];
     logic signed [LDW-1:0]       lenet_fc7_w     [0:9][0:83];
     logic signed [FC7_ACC_W-1:0] lenet_fc7_b     [0:9];
-    logic signed [FC7_ACC_W-1:0] lenet_scores    [0:9];
+    logic [FC7_ACC_W*10-1:0]     lenet_scores_flat;
     logic                        lenet_start, lenet_done;
 
     lenet #(
@@ -171,7 +171,7 @@ module tb_lenet_modules;
         .fc6_bias   (lenet_fc6_b),
         .fc7_weight (lenet_fc7_w),
         .fc7_bias   (lenet_fc7_b),
-        .scores     (lenet_scores),
+        .scores_flat(lenet_scores_flat),
         .done       (lenet_done)
     );
 
@@ -180,6 +180,13 @@ module tb_lenet_modules;
     // =======================================================================
     integer r, c, pass_count, fail_count;
     logic all_correct;
+
+    // Helper variables for extracting flat vector elements
+    logic signed [CACC-1:0]     conv_val;
+    logic signed [7:0]          pool_val;
+    logic signed [7:0]          relu_val;
+    logic signed [DENSE_ACC-1:0] dense_val;
+    logic signed [FC7_ACC_W-1:0] score_val;
 
     initial begin
         mac_en      = 0;
@@ -208,10 +215,10 @@ module tb_lenet_modules;
         mac_en = 0;
         if (mac_out == 54) begin
             $display("  PASS: MAC result = %0d", mac_out);
-            pass_count++;
+            pass_count = pass_count + 1;
         end else begin
             $display("  FAIL: MAC result = %0d (expected 54)", mac_out);
-            fail_count++;
+            fail_count = fail_count + 1;
         end
 
         // ------------------------------------------------------------------
@@ -236,17 +243,25 @@ module tb_lenet_modules;
         conv_start = 0;
 
         while (conv_ready !== 1'b1) begin @(posedge clk); #1; end
-        if (conv_result[0][0] == 54 && conv_result[0][1] == 63 &&
-            conv_result[1][0] == 90 && conv_result[1][1] == 99) begin
+
+        // Extract elements from flat vector: [r][c] at [(r*OUT_W+c)*CACC +: CACC]
+        if ($signed(conv_result_flat[(0*OUT_W+0)*CACC +: CACC]) == 54 &&
+            $signed(conv_result_flat[(0*OUT_W+1)*CACC +: CACC]) == 63 &&
+            $signed(conv_result_flat[(1*OUT_W+0)*CACC +: CACC]) == 90 &&
+            $signed(conv_result_flat[(1*OUT_W+1)*CACC +: CACC]) == 99) begin
             $display("  PASS: Conv outputs = {%0d, %0d, %0d, %0d}",
-                     conv_result[0][0], conv_result[0][1],
-                     conv_result[1][0], conv_result[1][1]);
-            pass_count++;
+                     $signed(conv_result_flat[(0*OUT_W+0)*CACC +: CACC]),
+                     $signed(conv_result_flat[(0*OUT_W+1)*CACC +: CACC]),
+                     $signed(conv_result_flat[(1*OUT_W+0)*CACC +: CACC]),
+                     $signed(conv_result_flat[(1*OUT_W+1)*CACC +: CACC]));
+            pass_count = pass_count + 1;
         end else begin
             $display("  FAIL: Conv outputs = {%0d, %0d, %0d, %0d} (expected {54,63,90,99})",
-                     conv_result[0][0], conv_result[0][1],
-                     conv_result[1][0], conv_result[1][1]);
-            fail_count++;
+                     $signed(conv_result_flat[(0*OUT_W+0)*CACC +: CACC]),
+                     $signed(conv_result_flat[(0*OUT_W+1)*CACC +: CACC]),
+                     $signed(conv_result_flat[(1*OUT_W+0)*CACC +: CACC]),
+                     $signed(conv_result_flat[(1*OUT_W+1)*CACC +: CACC]));
+            fail_count = fail_count + 1;
         end
 
         // ------------------------------------------------------------------
@@ -268,17 +283,25 @@ module tb_lenet_modules;
         pool_start = 0;
 
         while (pool_valid !== 1'b1) begin @(posedge clk); #1; end
-        if (pool_out[0][0] == 3 && pool_out[0][1] == 5 &&
-            pool_out[1][0] == 11 && pool_out[1][1] == 13) begin
+
+        // Extract elements: [r][c] at [(r*2+c)*8 +: 8]
+        if ($signed(pool_out_flat[(0*2+0)*8 +: 8]) == 3 &&
+            $signed(pool_out_flat[(0*2+1)*8 +: 8]) == 5 &&
+            $signed(pool_out_flat[(1*2+0)*8 +: 8]) == 11 &&
+            $signed(pool_out_flat[(1*2+1)*8 +: 8]) == 13) begin
             $display("  PASS: Pool outputs = {%0d, %0d, %0d, %0d}",
-                     pool_out[0][0], pool_out[0][1],
-                     pool_out[1][0], pool_out[1][1]);
-            pass_count++;
+                     $signed(pool_out_flat[(0*2+0)*8 +: 8]),
+                     $signed(pool_out_flat[(0*2+1)*8 +: 8]),
+                     $signed(pool_out_flat[(1*2+0)*8 +: 8]),
+                     $signed(pool_out_flat[(1*2+1)*8 +: 8]));
+            pass_count = pass_count + 1;
         end else begin
             $display("  FAIL: Pool outputs = {%0d, %0d, %0d, %0d} (expected {3,5,11,13})",
-                     pool_out[0][0], pool_out[0][1],
-                     pool_out[1][0], pool_out[1][1]);
-            fail_count++;
+                     $signed(pool_out_flat[(0*2+0)*8 +: 8]),
+                     $signed(pool_out_flat[(0*2+1)*8 +: 8]),
+                     $signed(pool_out_flat[(1*2+0)*8 +: 8]),
+                     $signed(pool_out_flat[(1*2+1)*8 +: 8]));
+            fail_count = fail_count + 1;
         end
 
         // ------------------------------------------------------------------
@@ -297,17 +320,28 @@ module tb_lenet_modules;
         relu_start = 0;
 
         while (relu_valid !== 1'b1) begin @(posedge clk); #1; end
-        if (relu_out[0] == 0 && relu_out[1] == 0 && relu_out[2] == 0 &&
-            relu_out[3] == 2 && relu_out[4] == 5) begin
+
+        // Extract elements: [i] at [i*8 +: 8]
+        if ($signed(relu_out_flat[0*8 +: 8]) == 0 &&
+            $signed(relu_out_flat[1*8 +: 8]) == 0 &&
+            $signed(relu_out_flat[2*8 +: 8]) == 0 &&
+            $signed(relu_out_flat[3*8 +: 8]) == 2 &&
+            $signed(relu_out_flat[4*8 +: 8]) == 5) begin
             $display("  PASS: ReLU outputs = {%0d, %0d, %0d, %0d, %0d}",
-                     relu_out[0], relu_out[1], relu_out[2],
-                     relu_out[3], relu_out[4]);
-            pass_count++;
+                     $signed(relu_out_flat[0*8 +: 8]),
+                     $signed(relu_out_flat[1*8 +: 8]),
+                     $signed(relu_out_flat[2*8 +: 8]),
+                     $signed(relu_out_flat[3*8 +: 8]),
+                     $signed(relu_out_flat[4*8 +: 8]));
+            pass_count = pass_count + 1;
         end else begin
             $display("  FAIL: ReLU outputs = {%0d, %0d, %0d, %0d, %0d} (expected {0,0,0,2,5})",
-                     relu_out[0], relu_out[1], relu_out[2],
-                     relu_out[3], relu_out[4]);
-            fail_count++;
+                     $signed(relu_out_flat[0*8 +: 8]),
+                     $signed(relu_out_flat[1*8 +: 8]),
+                     $signed(relu_out_flat[2*8 +: 8]),
+                     $signed(relu_out_flat[3*8 +: 8]),
+                     $signed(relu_out_flat[4*8 +: 8]));
+            fail_count = fail_count + 1;
         end
 
         // ------------------------------------------------------------------
@@ -333,13 +367,19 @@ module tb_lenet_modules;
         dense_start = 0;
 
         while (dense_valid !== 1'b1) begin @(posedge clk); #1; end
-        if (dense_out[0] == 6 && dense_out[1] == 15) begin
-            $display("  PASS: Dense outputs = {%0d, %0d}", dense_out[0], dense_out[1]);
-            pass_count++;
+
+        // Extract elements: [j] at [j*DENSE_ACC +: DENSE_ACC]
+        if ($signed(dense_out_flat[0*DENSE_ACC +: DENSE_ACC]) == 6 &&
+            $signed(dense_out_flat[1*DENSE_ACC +: DENSE_ACC]) == 15) begin
+            $display("  PASS: Dense outputs = {%0d, %0d}",
+                     $signed(dense_out_flat[0*DENSE_ACC +: DENSE_ACC]),
+                     $signed(dense_out_flat[1*DENSE_ACC +: DENSE_ACC]));
+            pass_count = pass_count + 1;
         end else begin
             $display("  FAIL: Dense outputs = {%0d, %0d} (expected {6, 15})",
-                     dense_out[0], dense_out[1]);
-            fail_count++;
+                     $signed(dense_out_flat[0*DENSE_ACC +: DENSE_ACC]),
+                     $signed(dense_out_flat[1*DENSE_ACC +: DENSE_ACC]));
+            fail_count = fail_count + 1;
         end
 
         // ------------------------------------------------------------------
@@ -420,7 +460,7 @@ module tb_lenet_modules;
             end
             if (lenet_done !== 1'b1) begin
                 $display("  TIMEOUT: LeNet forward pass did not complete!");
-                fail_count++;
+                fail_count = fail_count + 1;
             end
         end
 
@@ -428,19 +468,21 @@ module tb_lenet_modules;
             $display("  Forward pass completed successfully!");
             $display("  Output scores:");
             for (int s = 0; s < 10; s++)
-                $display("    scores[%0d] = %0d", s, lenet_scores[s]);
+                $display("    scores[%0d] = %0d", s,
+                         $signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]));
 
             // Verify all scores equal expected value (10668)
             all_correct = 1;
             for (int s = 0; s < 10; s++)
-                if (lenet_scores[s] !== 10668) all_correct = 0;
+                if ($signed(lenet_scores_flat[s*FC7_ACC_W +: FC7_ACC_W]) !== 10668)
+                    all_correct = 0;
 
             if (all_correct) begin
                 $display("  PASS: All scores = 10668 (matches expected)");
-                pass_count++;
+                pass_count = pass_count + 1;
             end else begin
                 $display("  FAIL: Expected all scores = 10668");
-                fail_count++;
+                fail_count = fail_count + 1;
             end
         end
 
