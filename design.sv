@@ -207,13 +207,16 @@ module relu #(
     end
 endmodule
 
-// Dense (FC) — all neurons in one cycle
+// Dense (FC) — partial unrolling support
+// Computes NEURONS_PER_CYCLE neurons each clock cycle.
+// Set NEURONS_PER_CYCLE = OUT_FEATURES for single-cycle (fully unrolled).
 // Output: flat packed vector, element [j] at [j*ACC_WIDTH +: ACC_WIDTH]
 module dense #(
-    parameter DATA_WIDTH    = 8,
-    parameter IN_FEATURES   = 120,
-    parameter OUT_FEATURES  = 84,
-    parameter ACC_WIDTH     = DATA_WIDTH * 2 + $clog2(IN_FEATURES)
+    parameter DATA_WIDTH        = 8,
+    parameter IN_FEATURES       = 120,
+    parameter OUT_FEATURES      = 84,
+    parameter ACC_WIDTH         = DATA_WIDTH * 2 + $clog2(IN_FEATURES),
+    parameter NEURONS_PER_CYCLE = OUT_FEATURES   // default: fully unrolled
 )(
     input  logic                          clk,
     input  logic                          rst_n,
@@ -224,28 +227,39 @@ module dense #(
     output logic [ACC_WIDTH*OUT_FEATURES-1:0] out_flat,
     output logic                          valid
 );
-    typedef enum logic [1:0] { IDLE, DONE } state_t;
+    typedef enum logic [1:0] { IDLE, COMPUTE, DONE } state_t;
     state_t state;
     logic signed [ACC_WIDTH-1:0] acc;
-    integer j, k;
+    integer j, k, base;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
             valid <= 1'b0;
+            base  <= 0;
         end else begin
             case (state)
                 IDLE: begin
                     valid <= 1'b0;
                     if (start) begin
-                        for (j = 0; j < OUT_FEATURES; j++) begin
-                            acc = bias[j];
-                            for (k = 0; k < IN_FEATURES; k++)
-                                acc = acc + (in_data[k] * weight[j][k]);
-                            out_flat[j*ACC_WIDTH +: ACC_WIDTH] = acc;
-                        end
-                        state <= DONE;
+                        base  <= 0;
+                        state <= COMPUTE;
                     end
+                end
+                COMPUTE: begin
+                    // Process up to NEURONS_PER_CYCLE neurons starting at base
+                    for (j = 0; j < NEURONS_PER_CYCLE; j++) begin
+                        if (base + j < OUT_FEATURES) begin
+                            acc = bias[base + j];
+                            for (k = 0; k < IN_FEATURES; k++)
+                                acc = acc + (in_data[k] * weight[base + j][k]);
+                            out_flat[(base + j)*ACC_WIDTH +: ACC_WIDTH] = acc;
+                        end
+                    end
+                    if (base + NEURONS_PER_CYCLE >= OUT_FEATURES)
+                        state <= DONE;
+                    else
+                        base <= base + NEURONS_PER_CYCLE;
                 end
                 DONE: begin
                     valid <= 1'b1;
@@ -486,7 +500,8 @@ module lenet #(
     logic signed [DATA_WIDTH-1:0] fc6_in [0:119];
 
     dense #(
-        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(400), .OUT_FEATURES(120)
+        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(400), .OUT_FEATURES(120),
+        .NEURONS_PER_CYCLE(30)   // 120/30 = 4 compute cycles
     ) u_fc5 (
         .clk(clk), .rst_n(rst_n), .start(fc5_go),
         .in_data(fc5_in), .weight(fc5_weight), .bias(fc5_bias),
@@ -509,7 +524,8 @@ module lenet #(
     logic signed [DATA_WIDTH-1:0] fc7_in [0:83];
 
     dense #(
-        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(120), .OUT_FEATURES(84)
+        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(120), .OUT_FEATURES(84),
+        .NEURONS_PER_CYCLE(21)   // 84/21 = 4 compute cycles
     ) u_fc6 (
         .clk(clk), .rst_n(rst_n), .start(fc6_go),
         .in_data(fc6_in), .weight(fc6_weight), .bias(fc6_bias),
@@ -529,7 +545,8 @@ module lenet #(
     //  FC7: dense(84 -> 10) — no ReLU on output
     // =====================================================================
     dense #(
-        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(84), .OUT_FEATURES(10)
+        .DATA_WIDTH(DATA_WIDTH), .IN_FEATURES(84), .OUT_FEATURES(10),
+        .NEURONS_PER_CYCLE(10)   // 10/10 = 1 compute cycle (fully unrolled)
     ) u_fc7 (
         .clk(clk), .rst_n(rst_n), .start(fc7_go),
         .in_data(fc7_in), .weight(fc7_weight), .bias(fc7_bias),
